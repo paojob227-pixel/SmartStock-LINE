@@ -1,0 +1,324 @@
+// --- 1. ตั้งค่าการเชื่อมต่อ (Constants) ---
+// ⚠️ คำเตือน: ห้ามนำ Token จริงใส่ไว้ใน GitHub สาธารณะ (Public Repository) แนะนำให้ใช้ Script Properties แทน
+const CHANNEL_ACCESS_TOKEN = PropertiesService.getScriptProperties().getProperty('LINE_CHANNEL_ACCESS_TOKEN') || 'ใส่_Channel_Access_Token_ของคุณที่นี่';
+const TARGET_GROUP_ID = PropertiesService.getScriptProperties().getProperty('LINE_TARGET_GROUP_ID') || 'ใส่_Target_Group_ID_ของคุณที่นี่';
+const SHEET_URL = 'ใส่_Google_Sheets_URL_ของคุณที่นี่'; 
+
+// --- 2. ฟังก์ชันหลัก: เมื่อส่งฟอร์ม (onFormSubmit) ---
+function onFormSubmit(e) {
+  try {
+    const values = e.values; // [Timestamp, ItemName, Qty, Expiry, Reporter]
+    const itemName = values[1];
+    const newQty = values[2];
+    const rawDateValue = values[3]; // ค่าดิบจากฟอร์ม เช่น '11/11/2025'
+    const newExpiry = parseDateSafe(rawDateValue); // แปลงเป็น Date Object
+    const reporter = values[4];
+    const timestamp = new Date(values[0]);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const masterSheet = ss.getSheetByName('MasterStock');
+    
+    if (!masterSheet) {
+      sendLineMessage("🚨 ระบบผิดพลาด!\nไม่พบชีต 'MasterStock' กรุณาสร้างชีตนี้ก่อน");
+      return;
+    }
+    
+    const data = masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, 1).getValues();
+    let foundRow = -1;
+
+    for (let i = 0; i < data.length; i++) {
+      if (data[i][0] == itemName) {
+        foundRow = i + 2;
+        break;
+      }
+    }
+
+    if (foundRow != -1) {
+      // เขียนข้อมูลลง MasterStock
+      masterSheet.getRange(foundRow, 2).setValue(newQty); // จำนวน
+      masterSheet.getRange(foundRow, 3).setValue(newExpiry ? newExpiry.toISOString() : null); // วันที่ (สำหรับสคริปต์อ่าน)
+      masterSheet.getRange(foundRow, 4).setValue(reporter); // ผู้รายงาน
+      masterSheet.getRange(foundRow, 5).setValue(timestamp); // เวลาอัปเดต
+      masterSheet.getRange(foundRow, 6).setValue(rawDateValue); // วันที่ (สำหรับคนอ่าน)
+
+      // เตรียมข้อความแจ้งเตือน
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      let expiryText = "(N/A - ไม่มีวันหมดอายุ)"; 
+
+      if (newExpiry && !isNaN(newExpiry.getTime())) {
+        const formattedExpiry = formatThaiDate(newExpiry);
+        const diffTime = newExpiry.getTime() - today.getTime();
+        const daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        if (daysRemaining < 0) {
+          expiryText = `(หมดอายุแล้ว ${Math.abs(daysRemaining)} วัน)`;
+        } else if (daysRemaining === 0) {
+          expiryText = `(หมดอายุวันนี้! 🚨)`;
+        } else {
+          expiryText = `(${formattedExpiry} อีก ${daysRemaining} วัน)`;
+        }
+      }
+
+      // จัดรูปแบบข้อความ LINE
+      const updateMessage = `🔔 **อัปเดตสต็อก**
+    
+📊 **รายการ:**
+└─ ${itemName}
+    
+📦 **จำนวนใหม่:**
+└─ ${newQty} ชิ้น
+    
+🗓️ **วันหมดอายุ:**
+└─ ${expiryText}
+    
+👤 **ผู้รายงาน:**
+└─ ${reporter}
+-----------------`;
+      sendLineMessage(updateMessage);
+      
+    } else {
+      // กรณีหาชื่อของไม่เจอ (สะกดผิด)
+      const errorMessage = `🚨 **ระบบผิดพลาด! (onFormSubmit)**
+    
+ไม่พบรายการ **"${itemName}"** ในชีต MasterStock
+    
+**สาเหตุ:**
+└─ อาจเกิดจาก "การสะกดชื่อ" ในฟอร์ม
+     ไม่ตรงกับในชีต MasterStock 100%
+     (เช่น การเว้นวรรค หรือตัวอักษร)
+     
+กรุณาตรวจสอบชื่อในคอลัมน์ A ของชีต MasterStock ครับ`;
+      sendLineMessage(errorMessage);
+    }
+  } catch (err) {
+    Logger.log("เกิด Error ใน onFormSubmit: " + err.message);
+    sendLineMessage("🚨 เกิด Error ร้ายแรงใน onFormSubmit:\n" + err.message);
+  }
+}
+
+// --- 3. ฟังก์ชันแจ้งเตือนรายวัน (checkStockAndAlertDaily) ---
+function checkStockAndAlertDaily() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const masterSheet = ss.getSheetByName('MasterStock');
+    
+    if (!masterSheet) {
+      sendLineMessage("🚨 ระบบผิดพลาด!\n(Daily Check) ไม่พบชีต 'MasterStock'");
+      return; 
+    }
+
+    const data = masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, 6).getValues(); 
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    let expiryAlertMessage = "🚨 **แจ้งเตือนของหมดอายุ / ใกล้หมดอายุ**";
+    let dailySummaryMessage = "🗓️ **สรุปสต็อกคงเหลือ (ประจำวัน)**";
+    
+    let expiryCount = 0;
+
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      if (!row[0]) continue; // ข้ามแถวว่าง
+
+      const itemName = row[0];
+      const quantity = row[1];
+      const expiryDate = parseDateSafe(row[2]); // อ่านจาก Col C (ISO String)
+
+      let expiryText = "ไม่พบวันหมดอายุ"; 
+      let daysRemaining = -999; // -999 = ไม่มีวันหมดอายุ
+
+      if (expiryDate && !isNaN(expiryDate.getTime())) {
+        const expiryDateString = formatThaiDate(expiryDate);
+        const diffTime = expiryDate.getTime() - today.getTime(); 
+        daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
+
+        if (daysRemaining < 0) {
+          expiryText = `หมดอายุแล้ว ${Math.abs(daysRemaining)} วัน`;
+        } else if (daysRemaining === 0) {
+          expiryText = `หมดอายุวันนี้! 🚨`;
+        } else {
+          expiryText = `หมดอายุ: ${expiryDateString} (อีก ${daysRemaining} วัน)`;
+        }
+      }
+      
+      // จัดรูปแบบสรุปรายวัน
+      dailySummaryMessage += `\n\n📦 **${itemName}**
+   ├ จำนวน: ${quantity} ชิ้น
+   └ สถานะ: ${expiryText}`;
+
+      // ตรวจสอบแจ้งเตือน (รวมของหมดอายุ)
+      if (daysRemaining <= 7 && daysRemaining !== -999) {
+        
+        let alertStatus = ""; 
+        if (daysRemaining < 0) {
+          alertStatus = `🔴 **หมดอายุแล้ว ${Math.abs(daysRemaining)} วัน!**`;
+        } else if (daysRemaining === 0) {
+          alertStatus = `🟠 **หมดอายุวันนี้!**`;
+        } else {
+          alertStatus = `🟡 หมดอายุอีก ${daysRemaining} วัน!`;
+        }
+
+        expiryAlertMessage += `\n\n├─ **${itemName}** (${quantity} ชิ้น)
+└─ ${alertStatus}`;
+        expiryCount++;
+      }
+    }
+
+    // เพิ่ม Link ในสรุปยอด
+    dailySummaryMessage += `\n\n---------------------------------
+🔗 **ดูตารางสต็อกฉบับเต็ม:**
+└─ ${SHEET_URL}`;
+
+    // ส่งแจ้งเตือน (ถ้ามี)
+    if (expiryCount > 0) {
+      sendLineMessage(expiryAlertMessage);
+      Utilities.sleep(1000); // รอ 1 วินาที
+    }
+    
+    // ส่งสรุปยอด
+    sendLineMessage(dailySummaryMessage);
+    
+  } catch (err) {
+    Logger.log("เกิด Error ใน checkStockAndAlertDaily: " + err.message);
+    sendLineMessage("🚨 เกิด Error ร้ายแรงใน checkStockAndAlertDaily:\n" + err.message);
+  }
+}
+
+// --- 4. ฟังก์ชันสำหรับส่ง LINE (sendLineMessage) ---
+function sendLineMessage(message) {
+  const url = 'https://api.line.me/v2/bot/message/push';
+  const payload = {
+    'to': TARGET_GROUP_ID, 
+    'messages': [ { 'type': 'text', 'text': message } ]
+  };
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'headers': {
+      'Authorization': 'Bearer ' + CHANNEL_ACCESS_TOKEN 
+    },
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true 
+  };
+  try {
+    UrlFetchApp.fetch(url, options);
+  } catch (e) {
+    Logger.log('เกิดข้อผิดพลาดในการส่ง LINE Push: ' + e.message);
+  }
+}
+
+// --- 5. ฟังก์ชันช่วย: แปลงวันที่ (parseDateSafe) ---
+function parseDateSafe(dateInput) {
+  if (dateInput instanceof Date && !isNaN(dateInput)) { return dateInput; }
+  if (typeof dateInput === 'string') {
+    let parts = dateInput.split('/');
+    if (parts.length === 3) {
+      const day = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10) - 1; 
+      const year = parseInt(parts[2], 10);
+      if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
+        return new Date(year, month, day);
+      }
+    }
+    const fallbackDate = new Date(dateInput);
+    if (!isNaN(fallbackDate.getTime())) { return fallbackDate; }
+  }
+  return null; 
+}
+
+// --- 6. ฟังก์ชันช่วย: แปลงวันที่เป็นไทย (formatThaiDate) ---
+function formatThaiDate(date) {
+  if (!date || isNaN(date.getTime())) {
+    return 'N/A';
+  }
+  return date.toLocaleDateString('th-TH', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+// --- 7. ฟังก์ชันทดสอบ: (runAllTasks) ---
+function runAllTasks() {
+  Logger.log("===== เริ่มทดสอบการทำงาน =====");
+  Logger.log("กำลังเรียก checkStockAndAlertDaily()...");
+  checkStockAndAlertDaily();
+  Logger.log("checkStockAndAlertDaily() ทำงานเสร็จสิ้น");
+  Logger.log("--- ข้อควรทราบ ---");
+  Logger.log("ฟังก์ชัน onFormSubmit(e) ไม่สามารถถูกเรียกจากตรงนี้ได้");
+  Logger.log("===== การทดสอบเสร็จสิ้น =====");
+}
+
+// --- 8. ฟังก์ชันบันทึกประวัติรายวัน (logDailyStockLevels) ---
+function logDailyStockLevels() {
+  try {
+    const today = new Date();
+    const day = today.getDate(); 
+    const month = today.getMonth(); 
+    const year = today.getFullYear();
+    
+    const sheetName = `ประวัติ_${month + 1}-${year}`;
+    const colIndex = day + 1; 
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const masterSheet = ss.getSheetByName('MasterStock');
+    let historySheet = ss.getSheetByName(sheetName);
+
+    if (!historySheet) {
+      historySheet = ss.insertSheet(sheetName);
+      
+      const daysInMonth = new Date(year, month + 1, 0).getDate(); 
+      const header = ['รายการของ'];
+      for (let d = 1; d <= daysInMonth; d++) {
+        header.push(d); 
+      }
+      historySheet.getRange(1, 1, 1, header.length).setValues([header]);
+      
+      const itemNames = masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, 1).getValues();
+      if (itemNames.length > 0) {
+        historySheet.getRange(2, 1, itemNames.length, 1).setValues(itemNames);
+      }
+      
+      historySheet.setFrozenRows(1);
+      historySheet.setFrozenColumns(1);
+    }
+
+    const historyItemsRange = historySheet.getRange(2, 1, historySheet.getLastRow() - 1, 1);
+    const historyItems = historyItemsRange.getValues();
+    if (historyItems.length === 0) {
+      Logger.log("ไม่มีรายการของในชีตประวัติ");
+      return; 
+    }
+    
+    const masterData = masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, 2).getValues(); 
+    
+    const masterMap = {};
+    masterData.forEach(row => {
+      masterMap[row[0]] = row[1]; 
+    });
+    
+    const quantitiesToLog = [];
+    historyItems.forEach(row => {
+      const itemName = row[0];
+      const quantity = masterMap[itemName] !== undefined ? masterMap[itemName] : 0; 
+      quantitiesToLog.push([quantity]); 
+    });
+    
+    if (quantitiesToLog.length > 0) {
+      historySheet.getRange(2, colIndex, quantitiesToLog.length, 1).setValues(quantitiesToLog);
+    }
+    
+    Logger.log(`บันทึกสต็อกประจำวันที่ ${day} ลงในชีต ${sheetName} สำเร็จ`);
+    
+  } catch (err) {
+    Logger.log("เกิด Error ใน logDailyStockLevels: " + err.message);
+    sendLineMessage("🚨 เกิด Error ร้ายแรงใน logDailyStockLevels:\n" + err.message);
+  }
+}
+
+function doGet() {
+  return HtmlService
+    .createHtmlOutputFromFile('index')
+    .setTitle('Stock Dashboard');
+}
